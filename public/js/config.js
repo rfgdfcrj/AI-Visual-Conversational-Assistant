@@ -4,8 +4,8 @@
  */
 
 export const DEFAULT_CONFIG = {
-  // API
-  apiEndpoint: '/api/chat',
+  // API 端点已硬编码在后端代理中，前端不可配置（防劫持）
+  // apiEndpoint 不再存在于配置中，ai.js 中固定为 '/api/chat'
   model: 'qwen-vl-plus',
 
   // 摄像头
@@ -29,8 +29,56 @@ export const DEFAULT_CONFIG = {
 
   // 对话
   maxHistory: 20,            // 最大消息历史
-  autoSpeak: true,           // TTS 自动朗读 AI 回复
+  autoSpeak: false,          // TTS 自动朗读 AI 回复（默认关闭，用户手动开启）
 };
+
+// ── 安全限制常量（前后端保持一致）─────────────────────────────────────
+export const LIMITS = {
+  MAX_INPUT_LENGTH: 2000,        // 单次输入最大字符数
+  MAX_MESSAGE_LENGTH: 4000,      // 单条消息存储最大字符数
+  MAX_CONVERSATIONS: 50,         // 最多对话数量
+  MAX_MESSAGES_PER_CONV: 500,    // 单对话最多消息数
+  MAX_IMAGES_PER_REQUEST: 5,     // 每次请求最多图像数
+  MAX_CONV_TITLE_LENGTH: 50,     // 对话标题最大长度
+};
+
+// 对话持久化存储键名
+export const CONV_STORAGE_KEY = 'vision-buddy-conversations';
+
+/**
+ * 对话数据结构
+ * @typedef {Object} Conversation
+ * @property {string} id - 唯一标识
+ * @property {string} title - 对话标题
+ * @property {number} createdAt - 创建时间戳
+ * @property {number} updatedAt - 更新时间戳
+ * @property {Array<{role:string, content:string}>} messages - 消息列表
+ */
+
+/**
+ * 从 localStorage 加载所有对话
+ * @returns {{ conversations: Conversation[], activeId: string|null }}
+ */
+export function loadConversations() {
+  try {
+    const raw = localStorage.getItem(CONV_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    console.warn('加载对话失败', e);
+  }
+  return { conversations: [], activeId: null };
+}
+
+/**
+ * 保存所有对话到 localStorage
+ */
+export function saveConversations(data) {
+  try {
+    localStorage.setItem(CONV_STORAGE_KEY, JSON.stringify(data));
+  } catch (e) {
+    console.warn('保存对话失败（可能超出存储限制）', e);
+  }
+}
 
 // localStorage 键名
 const STORAGE_KEY = 'vision-buddy-config';
@@ -43,6 +91,8 @@ export function loadConfig() {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       const parsed = JSON.parse(stored);
+      // 安全：强制删除 apiEndpoint，防止 localStorage 投毒劫持 API 请求
+      delete parsed.apiEndpoint;
       return { ...DEFAULT_CONFIG, ...parsed };
     }
   } catch (e) {

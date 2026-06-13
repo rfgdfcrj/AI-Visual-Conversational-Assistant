@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
   <meta name="theme-color" content="#151311">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -16,9 +16,26 @@
 </head>
 <body>
   <!-- ================================================================== -->
-  <!-- 主布局：左侧视频 + 右侧对话                                          -->
+  <!-- 主布局：对话侧栏 + 左侧视频 + 右侧对话                               -->
   <!-- ================================================================== -->
   <div class="app-container">
+
+    <!-- ─── 对话列表侧栏 ─── -->
+    <nav id="conversationSidebar" class="conv-sidebar">
+      <div class="conv-sidebar-header">
+        <h3>对话列表</h3>
+        <button id="btnNewConv" class="btn btn-ghost btn-sm" title="新建对话">＋ 新建</button>
+      </div>
+      <div id="convList" class="conv-list">
+        <!-- 动态渲染 -->
+      </div>
+      <div class="conv-sidebar-footer">
+        <button id="btnToggleSidebar" class="btn btn-ghost btn-sm" title="收起侧栏">◀ 收起</button>
+      </div>
+    </nav>
+
+    <!-- ─── 侧栏收起时的展开按钮 ─── -->
+    <button id="btnExpandSidebar" class="btn-expand-sidebar" title="展开对话列表" style="display:none;">☰</button>
 
     <!-- ─── 左侧面板：摄像头预览 + 状态 ─── -->
     <aside class="video-panel">
@@ -27,7 +44,7 @@
           <span class="icon-eye">👁️</span>
           Vision Buddy
         </h1>
-        <span class="version">v1.0</span>
+        <span class="version">v2.0</span>
       </div>
 
       <!-- 摄像头画面 -->
@@ -115,8 +132,16 @@
     <!-- ─── 右侧面板：对话区域 ─── -->
     <main class="chat-panel">
       <div class="chat-header">
-        <h2>对话</h2>
-        <button id="btnClearChat" class="btn btn-ghost btn-sm">清空对话</button>
+        <h2 id="convTitle">对话</h2>
+        <div class="chat-header-actions">
+          <button id="btnTTS" class="btn btn-tts" title="语音播报（关闭）">
+            <span>🔇</span>
+          </button>
+          <button id="btnMobileConvList" class="btn btn-ghost btn-sm btn-mobile-conv" title="对话列表">
+            💬
+          </button>
+          <button id="btnClearChat" class="btn btn-ghost btn-sm">清空对话</button>
+        </div>
       </div>
 
       <!-- 对话消息列表 -->
@@ -144,6 +169,7 @@
             class="text-input"
             placeholder="输入消息，或直接对着麦克风说话..."
             autocomplete="off"
+            maxlength="2000"
           >
           <button id="btnSend" class="btn btn-send" title="发送消息">
             <span>发送</span>
@@ -157,6 +183,23 @@
   </div>
 
   <!-- ================================================================== -->
+  <!-- 移动端对话列表抽屉                                                   -->
+  <!-- ================================================================== -->
+  <div id="convOverlay" class="conv-overlay" style="display:none;"></div>
+  <div id="convDrawer" class="conv-drawer" style="display:none;">
+    <div class="conv-drawer-header">
+      <h3>对话列表</h3>
+      <button id="btnNewConvDrawer" class="btn btn-ghost btn-sm">＋ 新建</button>
+    </div>
+    <div id="convDrawerList" class="conv-list">
+      <!-- 动态渲染 -->
+    </div>
+    <div class="conv-drawer-footer">
+      <button id="btnCloseDrawer" class="btn btn-secondary">关闭</button>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
   <!-- 设置模态框                                                          -->
   <!-- ================================================================== -->
   <dialog id="settingsModal" class="modal">
@@ -167,11 +210,7 @@
       </div>
       <div class="modal-body">
         <div class="setting-group">
-          <h4>API 配置</h4>
-          <label>
-            API 端点
-            <input type="text" id="settingApiEndpoint" value="/api/chat" class="setting-input">
-          </label>
+          <h4>图像配置</h4>
           <label>
             图像最大尺寸 (px)
             <input type="number" id="settingMaxDimension" value="512" min="256" max="1024" class="setting-input">
@@ -197,7 +236,7 @@
         <div class="setting-group">
           <h4>语音设置</h4>
           <label>
-            语言
+            识别语言
             <select id="settingLanguage" class="setting-input">
               <option value="zh-CN">中文（普通话）</option>
               <option value="en-US">English (US)</option>
@@ -205,10 +244,14 @@
             </select>
           </label>
           <label>
-            语音合成音色
+            合成音色
             <select id="settingVoice" class="setting-input">
               <option value="">默认</option>
             </select>
+          </label>
+          <label>
+            <input type="checkbox" id="settingAutoSpeak">
+            AI 回复后自动语音播报
           </label>
         </div>
       </div>

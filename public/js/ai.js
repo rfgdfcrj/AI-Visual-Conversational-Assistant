@@ -12,7 +12,8 @@ import { TokenTracker } from './config.js';
 
 export class AIService {
   constructor(config = {}) {
-    this.apiEndpoint = config.apiEndpoint || '/api/chat';
+    // API 端点硬编码，不可从外部配置（安全性：防止 localStorage 劫持）
+    this.apiEndpoint = '/api/chat';
     this.model = config.model || 'qwen-vl-plus';
     this.maxHistory = config.maxHistory || 20;
 
@@ -175,7 +176,7 @@ export class AIService {
    * 更新配置
    */
   updateConfig(config) {
-    if (config.apiEndpoint) this.apiEndpoint = config.apiEndpoint;
+    // apiEndpoint 不允许运行时修改（防劫持）
     if (config.model) this.model = config.model;
     if (config.maxHistory) this.maxHistory = config.maxHistory;
   }

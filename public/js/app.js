@@ -1,14 +1,16 @@
 /**
- * AI 视觉对话助手 — 主应用控制器
+ * AI 视觉对话助手 — 主应用控制器 v2.0
  *
- * 职责：
- *  - 协调 CameraManager、SpeechManager、AIService 三个模块
- *  - 管理 UI 状态（按钮、状态指示器、对话显示）
- *  - 处理用户交互（按钮点击、文本输入、设置变更）
- *  - 实现端云协同的成本控制逻辑
+ * 新增：
+ *  - 防并发机制（处理中禁用所有触发入口）
+ *  - TTS 手动切换（默认关闭）
+ *  - 运动状态修复（摄像头关闭时隐藏指示器）
+ *  - 多对话管理（localStorage 持久化）
+ *  - 连续拍照防失效（取消进行中的请求）
+ *  - 移动端对话抽屉
  */
 
-import { loadConfig, saveConfig } from './config.js';
+import { loadConfig, saveConfig, loadConversations, saveConversations, LIMITS } from './config.js';
 import { CameraManager } from './camera.js';
 import { SpeechManager } from './speech.js';
 import { AIService } from './ai.js';
@@ -30,10 +32,17 @@ class AppController {
     this.pendingSnapshot = false; // 是否需要在下一次发送时附加快照
     this.totalCost = 0;
 
+    // 对话管理
+    this.convData = loadConversations();
+    this.activeConvId = this.convData.activeId;
+
+    // TTS 状态
+    this.ttsEnabled = this.config.autoSpeak || false;
+
     // DOM 引用（在 init() 中填充）
     this.elements = {};
 
-    // 绑定方法（确保 this 正确）
+    // 绑定方法
     this._onFrame = this._onFrame.bind(this);
     this._onMotionState = this._onMotionState.bind(this);
     this._onSpeechFinal = this._onSpeechFinal.bind(this);
@@ -45,14 +54,11 @@ class AppController {
   // 初始化
   // -----------------------------------------------------------------------
 
-  /**
-   * 应用入口：初始化所有 DOM 引用和事件监听器
-   */
   init() {
     this._cacheElements();
     this._bindEvents();
 
-    // 初始化摄像头模块（绑定 video/canvas 元素）
+    // 初始化摄像头模块
     this.camera.init(
       this.elements.cameraVideo,
       this.elements.captureCanvas
@@ -61,11 +67,362 @@ class AppController {
     // 加载可用语音音色
     this._loadVoices();
 
-    // 从 localStorage 恢复 UI 状态
+    // 恢复 UI 状态
     this._restoreSettings();
+    this._updateTTSButton();
 
-    console.log('🚀 Vision Buddy 初始化完成');
+    // 恢复对话列表
+    this._renderConvList();
+    this._restoreActiveConversation();
+
+    console.log('🚀 Vision Buddy v2.0 初始化完成');
     console.log('📋 配置:', this.config);
+    console.log('💬 对话数据:', this.convData);
+  }
+
+  // -----------------------------------------------------------------------
+  // 对话管理
+  // -----------------------------------------------------------------------
+
+  /**
+   * 生成唯一对话 ID
+   */
+  _generateId() {
+    return 'conv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  }
+
+  /**
+   * 获取当前活跃的对话对象
+   */
+  _getActiveConv() {
+    if (!this.activeConvId) return null;
+    return this.convData.conversations.find(c => c.id === this.activeConvId) || null;
+  }
+
+  /**
+   * 创建新对话
+   */
+  _createConversation() {
+    // 对话数量限制
+    if (this.convData.conversations.length >= LIMITS.MAX_CONVERSATIONS) {
+      this._showToast(`最多保留 ${LIMITS.MAX_CONVERSATIONS} 个对话，请先删除旧的`, 'warning');
+      return;
+    }
+
+    const conv = {
+      id: this._generateId(),
+      title: '新对话',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [],
+    };
+    this.convData.conversations.unshift(conv);
+    this.activeConvId = conv.id;
+    this.convData.activeId = conv.id;
+    this._safeSaveConversations();
+
+    // 同步 AI 服务的历史
+    this.ai.clearHistory();
+    this._renderChatMessages([]);
+    this._renderConvList();
+    this._updateConvTitle();
+    this._showToast('新建对话', 'info');
+  }
+
+  /**
+   * 切换对话
+   */
+  _switchConversation(convId) {
+    if (convId === this.activeConvId) return;
+
+    // 取消当前请求
+    if (this.isProcessing) {
+      this.ai.cancel();
+      this.isProcessing = false;
+      this._updateProcessingUI(false);
+    }
+
+    this.activeConvId = convId;
+    this.convData.activeId = convId;
+    this._safeSaveConversations();
+
+    // 恢复对话历史到 AI 服务
+    const conv = this._getActiveConv();
+    this.ai.clearHistory();
+    if (conv) {
+      // 只恢复最近的文本消息到 AI 服务
+      const recentMessages = conv.messages.slice(-this.config.maxHistory * 2);
+      for (const msg of recentMessages) {
+        this.ai.messageHistory.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    this._renderChatMessages(conv ? conv.messages : []);
+    this._renderConvList();
+    this._updateConvTitle();
+  }
+
+  /**
+   * 删除对话
+   */
+  _deleteConversation(convId, e) {
+    e.stopPropagation();
+
+    if (this.convData.conversations.length <= 1) {
+      this._showToast('至少保留一个对话', 'warning');
+      return;
+    }
+
+    this.convData.conversations = this.convData.conversations.filter(c => c.id !== convId);
+
+    // 如果删除的是当前对话，切换到第一个
+    if (convId === this.activeConvId) {
+      this.activeConvId = this.convData.conversations[0]?.id || null;
+      this.convData.activeId = this.activeConvId;
+      const conv = this._getActiveConv();
+      this.ai.clearHistory();
+      if (conv) {
+        for (const msg of conv.messages) {
+          this.ai.messageHistory.push({ role: msg.role, content: msg.content });
+        }
+      }
+      this._renderChatMessages(conv ? conv.messages : []);
+      this._updateConvTitle();
+    }
+
+    this._safeSaveConversations();
+    this._renderConvList();
+    this._showToast('对话已删除', 'info');
+  }
+
+  /**
+   * 渲染对话列表（侧栏 + 移动端抽屉）
+   */
+  _renderConvList() {
+    const convs = this.convData.conversations;
+
+    const renderItem = (conv) => {
+      const time = new Date(conv.updatedAt).toLocaleDateString('zh-CN', {
+        month: 'numeric', day: 'numeric',
+      });
+      const isActive = conv.id === this.activeConvId;
+      return `
+        <div class="conv-item ${isActive ? 'active' : ''}"
+             data-conv-id="${conv.id}"
+             title="${this._escapeHtml(conv.title)}">
+          <div class="conv-item-icon">${isActive ? '💬' : '📝'}</div>
+          <div class="conv-item-info">
+            <div class="conv-item-title">${this._escapeHtml(conv.title)}</div>
+            <div class="conv-item-time">${time}</div>
+          </div>
+          <button class="conv-item-delete" data-delete="${conv.id}" title="删除">×</button>
+        </div>`;
+    };
+
+    // 桌面侧栏
+    const listEl = this.elements.convList;
+    if (listEl) {
+      listEl.innerHTML = convs.length === 0
+        ? '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:var(--text-xs);">暂无对话</div>'
+        : convs.map(renderItem).join('');
+
+      // 绑定点击事件
+      listEl.querySelectorAll('.conv-item').forEach(item => {
+        item.addEventListener('click', () => {
+          const id = item.dataset.convId;
+          if (id) this._switchConversation(id);
+        });
+      });
+      listEl.querySelectorAll('.conv-item-delete').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const id = btn.dataset.delete;
+          if (id) this._deleteConversation(id, e);
+        });
+      });
+    }
+
+    // 移动端抽屉
+    const drawerList = this.elements.convDrawerList;
+    if (drawerList) {
+      drawerList.innerHTML = convs.map(renderItem).join('');
+      drawerList.querySelectorAll('.conv-item').forEach(item => {
+        item.addEventListener('click', () => {
+          const id = item.dataset.convId;
+          if (id) {
+            this._switchConversation(id);
+            this._closeDrawer();
+          }
+        });
+      });
+      drawerList.querySelectorAll('.conv-item-delete').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const id = btn.dataset.delete;
+          if (id) this._deleteConversation(id, e);
+        });
+      });
+    }
+  }
+
+  /**
+   * 恢复上次活跃的对话
+   */
+  _restoreActiveConversation() {
+    // 没有对话则创建默认对话
+    if (this.convData.conversations.length === 0) {
+      this._createConversation();
+      return;
+    }
+
+    // 恢复活跃对话
+    if (this.activeConvId) {
+      const conv = this._getActiveConv();
+      if (conv) {
+        this.ai.clearHistory();
+        const recent = conv.messages.slice(-this.config.maxHistory * 2);
+        for (const msg of recent) {
+          this.ai.messageHistory.push({ role: msg.role, content: msg.content });
+        }
+        this._renderChatMessages(conv.messages);
+        this._updateConvTitle();
+        return;
+      }
+    }
+
+    // 活跃对话丢失，使用第一个
+    this.activeConvId = this.convData.conversations[0].id;
+    this.convData.activeId = this.activeConvId;
+    this._safeSaveConversations();
+    const conv = this._getActiveConv();
+    if (conv) {
+      for (const msg of conv.messages) {
+        this.ai.messageHistory.push({ role: msg.role, content: msg.content });
+      }
+      this._renderChatMessages(conv.messages);
+      this._updateConvTitle();
+    }
+  }
+
+  /**
+   * 更新对话标题
+   */
+  _updateConvTitle() {
+    const conv = this._getActiveConv();
+    const title = conv ? conv.title : '对话';
+    if (this.elements.convTitle) {
+      this.elements.convTitle.textContent = title;
+    }
+  }
+
+  /**
+   * 根据对话内容自动生成标题
+   */
+  _autoTitle() {
+    const conv = this._getActiveConv();
+    if (!conv || conv.title !== '新对话') return;
+
+    // 取第一条用户消息作为标题
+    const firstUserMsg = conv.messages.find(m => m.role === 'user');
+    if (firstUserMsg) {
+      const text = typeof firstUserMsg.content === 'string'
+        ? firstUserMsg.content
+        : '';
+      conv.title = text.slice(0, LIMITS.MAX_CONV_TITLE_LENGTH)
+        + (text.length > LIMITS.MAX_CONV_TITLE_LENGTH ? '...' : '');
+      conv.updatedAt = Date.now();
+      this._safeSaveConversations();
+      this._renderConvList();
+      this._updateConvTitle();
+    }
+  }
+
+  /**
+   * 安全保存对话（处理 localStorage 配额溢出）
+   */
+  _safeSaveConversations() {
+    try {
+      saveConversations(this.convData);
+    } catch (e) {
+      console.warn('localStorage 存储失败，尝试清理旧数据', e);
+      // 保留最近 10 个对话，删除其余
+      if (this.convData.conversations.length > 10) {
+        this.convData.conversations = this.convData.conversations
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+          .slice(0, 10);
+      }
+      // 对每个对话只保留最近 100 条消息
+      for (const conv of this.convData.conversations) {
+        if (conv.messages.length > 100) {
+          conv.messages = conv.messages.slice(-100);
+        }
+      }
+      try {
+        saveConversations(this.convData);
+      } catch (e2) {
+        this._showToast('存储空间不足，请删除一些旧对话', 'warning');
+      }
+    }
+  }
+
+  /**
+   * 保存消息到当前对话
+   */
+  _saveMessageToConv(role, content) {
+    const conv = this._getActiveConv();
+    if (!conv) return;
+
+    // 消息数量限制
+    if (conv.messages.length >= LIMITS.MAX_MESSAGES_PER_CONV) {
+      conv.messages = conv.messages.slice(-LIMITS.MAX_MESSAGES_PER_CONV + 1);
+    }
+
+    // 截断过长消息内容
+    const safeContent = typeof content === 'string' && content.length > LIMITS.MAX_MESSAGE_LENGTH
+      ? content.slice(0, LIMITS.MAX_MESSAGE_LENGTH)
+      : content;
+
+    conv.messages.push({ role, content: safeContent });
+    conv.updatedAt = Date.now();
+    this._safeSaveConversations();
+
+    // 自动生成标题
+    if (conv.title === '新对话' && role === 'user') {
+      this._autoTitle();
+    }
+  }
+
+  /**
+   * 渲染对话消息到界面
+   */
+  _renderChatMessages(messages) {
+    const messagesEl = this.elements.chatMessages;
+    messagesEl.innerHTML = '';
+
+    if (messages.length === 0) {
+      messagesEl.innerHTML = `
+        <div class="welcome-message">
+          <div class="welcome-icon">🤖</div>
+          <h3>欢迎使用 Vision Buddy</h3>
+          <p>开启摄像头和麦克风后，AI 就能看到你、听到你。</p>
+          <p>试试直接说话，或者把物品展示给摄像头看！</p>
+        </div>`;
+      return;
+    }
+
+    messages.forEach(msg => {
+      const msgDiv = document.createElement('div');
+      msgDiv.className = `message ${msg.role}`;
+      const avatar = msg.role === 'user' ? '👤' : '🤖';
+      const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      msgDiv.innerHTML = `
+        <div class="message-avatar">${avatar}</div>
+        <div>
+          <div class="message-bubble">${this._escapeHtml(msg.content)}</div>
+          <div class="message-time">${time}</div>
+        </div>`;
+      messagesEl.appendChild(msgDiv);
+    });
+
+    this._scrollToBottom();
   }
 
   // -----------------------------------------------------------------------
@@ -91,16 +448,16 @@ class AppController {
       this.cameraActive = true;
       this._updateCameraUI(true);
 
-      // 自动开始帧捕获（经过运动检测过滤）
+      // 自动开始帧捕获
       this.camera.startCapture(this._onFrame, this._onMotionState);
 
-      // 立即捕获第一帧，确保后续语音触发时有画面可用
+      // 立即捕获第一帧
       setTimeout(() => {
         const initialFrame = this.camera.captureSnapshot();
         if (initialFrame) this._lastFrame = initialFrame;
-      }, 500); // 等摄像头曝光稳定
+      }, 500);
 
-      // 启用麦克风按钮和快照按钮
+      // 启用相关按钮
       this.elements.btnMic.disabled = false;
       this.elements.btnSnapshot.disabled = false;
 
@@ -124,6 +481,12 @@ class AppController {
     this.elements.btnMic.disabled = true;
     this.elements.btnSnapshot.disabled = true;
 
+    // 重置运动状态指示器（修复"关闭摄像头仍显示运动中"的 bug）
+    this._onMotionState(false);
+    // 隐藏运动指示器
+    const motionIndicator = document.getElementById('motionIndicator');
+    if (motionIndicator) motionIndicator.classList.add('hidden');
+
     this._showToast('摄像头已关闭', 'info');
   }
 
@@ -132,6 +495,7 @@ class AppController {
     const video = this.elements.cameraVideo;
     const placeholder = this.elements.cameraPlaceholder;
     const container = document.querySelector('.video-container');
+    const motionIndicator = document.getElementById('motionIndicator');
 
     if (active) {
       btn.classList.add('active');
@@ -142,6 +506,7 @@ class AppController {
       container.classList.add('active');
       this.elements.statusCamera.textContent = '已连接';
       this.elements.statusCamera.className = 'status-badge badge-on';
+      if (motionIndicator) motionIndicator.classList.remove('hidden');
     } else {
       btn.classList.remove('active');
       btn.querySelector('.btn-text').textContent = '开启摄像头';
@@ -170,7 +535,6 @@ class AppController {
 
   async _enableMic() {
     try {
-      // 设置语音回调
       this.speech.onFinalResult = this._onSpeechFinal;
       this.speech.onInterimResult = this._onSpeechInterim;
       this.speech.onSpeechEnd = this._onSpeechEnd;
@@ -214,11 +578,20 @@ class AppController {
   }
 
   // -----------------------------------------------------------------------
-  // 快照分析
+  // 快照分析（防并发）
   // -----------------------------------------------------------------------
 
   async takeSnapshot() {
-    if (!this.cameraActive) return;
+    // 防并发：处理中不允许触发
+    if (this.isProcessing) {
+      this._showToast('AI 正在回复中，请稍后...', 'warning');
+      return;
+    }
+
+    if (!this.cameraActive) {
+      this._showToast('请先开启摄像头', 'warning');
+      return;
+    }
 
     const frame = this.camera.captureSnapshot();
     if (!frame) {
@@ -226,13 +599,12 @@ class AppController {
       return;
     }
 
-    this._showToast('📸 正在分析当前画面...', 'info');
+    const snapshotPrompt = '（用户手动拍了一张快照，看看画面里有什么有趣的？）';
 
-    // 添加隐藏的系统提示
-    const snapshotPrompt = '（用户手动拍摄了一张快照，请详细描述你在这张照片中看到的内容。）';
-
-    this._addUserMessage(snapshotPrompt);
     this.isProcessing = true;
+    this._updateProcessingUI(true);
+    this._addUserMessage(snapshotPrompt);
+    this._saveMessageToConv('user', snapshotPrompt);
 
     await this.ai.sendMessage(snapshotPrompt, [frame], {
       onText: (delta) => this._appendToLastAssistantMessage(delta),
@@ -246,13 +618,27 @@ class AppController {
   }
 
   // -----------------------------------------------------------------------
-  // 文本输入
+  // 文本输入（防并发）
   // -----------------------------------------------------------------------
 
   async sendTextMessage() {
+    // 防并发：处理中不允许发送
+    if (this.isProcessing) {
+      this._showToast('AI 正在回复中，请稍后...', 'warning');
+      return;
+    }
+
     const input = this.elements.textInput;
-    const text = input.value.trim();
-    if (!text || this.isProcessing) return;
+    let text = input.value.trim();
+    if (!text) return;
+
+    // 长度校验
+    if (text.length > LIMITS.MAX_INPUT_LENGTH) {
+      this._showToast(`消息过长，最多 ${LIMITS.MAX_INPUT_LENGTH} 个字符`, 'warning');
+      text = text.slice(0, LIMITS.MAX_INPUT_LENGTH);
+      input.value = text;
+      return;
+    }
 
     input.value = '';
 
@@ -263,8 +649,15 @@ class AppController {
       if (frame) images.push(frame);
     }
 
-    this._addUserMessage(text);
+    // 图像数量校验
+    if (images.length > LIMITS.MAX_IMAGES_PER_REQUEST) {
+      images = images.slice(0, LIMITS.MAX_IMAGES_PER_REQUEST);
+    }
+
     this.isProcessing = true;
+    this._updateProcessingUI(true);
+    this._addUserMessage(text);
+    this._saveMessageToConv('user', text);
 
     await this.ai.sendMessage(text, images, {
       onText: (delta) => this._appendToLastAssistantMessage(delta),
@@ -281,30 +674,27 @@ class AppController {
   // 帧回调（来自 CameraManager）
   // -----------------------------------------------------------------------
 
-  /**
-   * 当运动检测触发时，自动发送当前帧给 AI 分析
-   * 这是一个低频率的自动分析，不会每次都发送
-   */
   _onFrame(base64Image) {
-    // 自动帧暂时只做缓存，不主动发送
-    // 避免在没有用户语音时频繁调用 API 产生费用
-    // 用户可以手动点击"快照分析"来触发视觉分析
+    // 自动帧只做缓存，不主动发送（避免无语音时消耗 API 费用）
     this._lastFrame = base64Image;
   }
 
   /**
-   * 运动状态变化
+   * 运动状态变化（修复：仅摄像头开启时更新 UI）
    */
   _onMotionState(isMoving) {
+    // 关键修复：摄像头关闭时不更新运动状态
+    if (!this.cameraActive) return;
+
     const dot = document.querySelector('.motion-dot');
     const label = document.querySelector('.motion-label');
 
     if (isMoving) {
-      dot.classList.add('active');
-      label.textContent = '运动中';
+      if (dot) dot.classList.add('active');
+      if (label) label.textContent = '运动中';
     } else {
-      dot.classList.remove('active');
-      label.textContent = '静止';
+      if (dot) dot.classList.remove('active');
+      if (label) label.textContent = '静止';
     }
   }
 
@@ -316,20 +706,36 @@ class AppController {
     console.log('🎤 识别:', text);
     this.elements.interimText.style.display = 'none';
 
+    // 防并发：AI 正在回复中，忽略用户语音
     if (this.isProcessing) {
-      // AI 正在回复中，忽略用户语音
+      this._showToast('AI 正在回复中，请稍后再说...', 'warning');
       return;
     }
 
-    // 实时捕获当前帧（不用缓存的 _lastFrame，确保 AI 看到最新画面）
+    // 语音识别结果校验
+    if (!text || !text.trim()) return;
+    text = text.trim();
+
+    // 截断过长语音识别结果
+    if (text.length > LIMITS.MAX_INPUT_LENGTH) {
+      text = text.slice(0, LIMITS.MAX_INPUT_LENGTH);
+    }
+
+    // 实时捕获当前帧
     let images = [];
     if (this.cameraActive) {
       const frame = this.camera.captureSnapshot();
       if (frame) images.push(frame);
     }
 
-    this._addUserMessage(text);
+    if (images.length > LIMITS.MAX_IMAGES_PER_REQUEST) {
+      images = images.slice(0, LIMITS.MAX_IMAGES_PER_REQUEST);
+    }
+
     this.isProcessing = true;
+    this._updateProcessingUI(true);
+    this._addUserMessage(text);
+    this._saveMessageToConv('user', text);
 
     this.ai.sendMessage(text, images, {
       onText: (delta) => this._appendToLastAssistantMessage(delta),
@@ -348,7 +754,7 @@ class AppController {
   }
 
   _onSpeechEnd() {
-    // TTS 播报结束，不需要额外处理
+    // TTS 播报结束
   }
 
   // -----------------------------------------------------------------------
@@ -357,6 +763,12 @@ class AppController {
 
   _onAIResponseComplete(fullText, usage) {
     this.isProcessing = false;
+    this._updateProcessingUI(false);
+
+    // 保存 AI 回复到当前对话
+    if (fullText) {
+      this._saveMessageToConv('assistant', fullText);
+    }
 
     // 更新 token 统计
     if (usage) {
@@ -368,16 +780,40 @@ class AppController {
       this._updateAssistantAvatar(fullText);
     }
 
-    // 自动朗读（如果启用）
-    if (this.config.autoSpeak && fullText) {
+    // TTS：根据用户选择决定是否朗读（默认关闭）
+    if (this.ttsEnabled && fullText) {
       this.speech.speak(fullText);
     }
+
+    // 更新对话列表（标题可能变了）
+    this._renderConvList();
   }
 
   _onAIError(error) {
     this.isProcessing = false;
+    this._updateProcessingUI(false);
     this._showToast(`AI 错误: ${error.message}`, 'error');
     console.error('AI 错误详情:', error);
+  }
+
+  // -----------------------------------------------------------------------
+  // 防并发 UI：处理中时禁用所有输入
+  // -----------------------------------------------------------------------
+
+  _updateProcessingUI(processing) {
+    // 快照按钮
+    this.elements.btnSnapshot.disabled = processing || !this.cameraActive;
+
+    // 发送按钮
+    this.elements.btnSend.disabled = processing;
+
+    // 文本输入
+    this.elements.textInput.disabled = processing;
+    if (processing) {
+      this.elements.textInput.placeholder = 'AI 正在回复中...';
+    } else {
+      this.elements.textInput.placeholder = '输入消息，或直接对着麦克风说话...';
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -423,7 +859,6 @@ class AppController {
     const lastAiMsg = messagesEl.querySelector('.message.assistant:last-of-type .message-bubble');
 
     if (lastAiMsg) {
-      // 移除"思考中..."占位
       const typing = lastAiMsg.querySelector('.typing-indicator');
       if (typing) typing.remove();
 
@@ -446,19 +881,19 @@ class AppController {
   _pickAssistantEmoji(text) {
     const lower = text.toLowerCase();
 
-    // 按优先级排列，先匹配到的优先
     const rules = [
       { emoji: '👋', keywords: ['你好', 'hello', 'hi', '欢迎', '嗨', '再见', '拜拜', 'bye'] },
       { emoji: '👀', keywords: ['看到', '看见', '画面', '图片', '摄像头', '镜头', '观察', '图像', '照片'] },
-      { emoji: '😮', keywords: ['惊讶', '哇', '哦', '天啊', '居然', '竟然', '没想到', '意外'] },
-      { emoji: '😊', keywords: ['开心', '高兴', '棒', '太好了', '哈哈', '不错', '喜欢', '很棒', '真好', '微笑', '😊'] },
-      { emoji: '💡', keywords: ['建议', '试试', '推荐', '提醒', '注意', '提示', '小技巧'] },
-      { emoji: '🤔', keywords: ['看起来', '好像', '可能', '不确定', '似乎', '也许', '大概'] },
-      { emoji: '👍', keywords: ['是的', '没错', '对', '好的', '正确', '可以', '没问题', '当然'] },
-      { emoji: '🎉', keywords: ['恭喜', '庆祝', '成功', '完成', '太好了', '优秀', '厉害'] },
-      { emoji: '😅', keywords: ['抱歉', '对不起', '不清楚', '无法', '不能', '遗憾'] },
-      { emoji: '💛', keywords: ['理解', '关心', '小心', '注意安全', '保重', '在乎', '陪伴'] },
-      { emoji: '🧠', keywords: ['分析', '推理', '逻辑', '深度', '思考', '推理'] },
+      { emoji: '😮', keywords: ['惊讶', '哇', '哦', '天啊', '居然', '竟然', '没想到', '意外', '哇塞'] },
+      { emoji: '😊', keywords: ['开心', '高兴', '棒', '太好了', '哈哈', '不错', '喜欢', '很棒', '真好', '微笑', 'hhh', 'hh'] },
+      { emoji: '💡', keywords: ['建议', '试试', '推荐', '提醒', '注意', '提示', '小技巧', '可以'] },
+      { emoji: '🤔', keywords: ['看起来', '好像', '可能', '不确定', '似乎', '也许', '大概', 'emmm'] },
+      { emoji: '👍', keywords: ['是的', '没错', '对', '好的', '正确', '没问题', '当然', '厉害'] },
+      { emoji: '🎉', keywords: ['恭喜', '庆祝', '成功', '完成', '优秀', '厉害', '牛逼'] },
+      { emoji: '😅', keywords: ['抱歉', '对不起', '不清楚', '无法', '不能', '遗憾', '看不清'] },
+      { emoji: '💛', keywords: ['理解', '关心', '小心', '注意安全', '保重', '在乎', '陪伴', '加油'] },
+      { emoji: '🧠', keywords: ['分析', '推理', '逻辑', '深度', '思考'] },
+      { emoji: '😏', keywords: ['偷偷', '哈哈', '摸鱼', '搞笑', '逗', '调皮'] },
     ];
 
     for (const rule of rules) {
@@ -469,13 +904,9 @@ class AppController {
       }
     }
 
-    // 默认保持机器人
     return '🤖';
   }
 
-  /**
-   * 更新最后一条 AI 消息的头像表情
-   */
   _updateAssistantAvatar(fullText) {
     const messagesEl = this.elements.chatMessages;
     const lastAiMsg = messagesEl.querySelector('.message.assistant:last-of-type');
@@ -486,11 +917,9 @@ class AppController {
 
     const emoji = this._pickAssistantEmoji(fullText);
 
-    // 添加切换动画类
     avatar.classList.add('emoji-switch');
     avatar.textContent = emoji;
 
-    // 动画结束后移除类
     avatar.addEventListener('animationend', () => {
       avatar.classList.remove('emoji-switch');
     }, { once: true });
@@ -504,6 +933,91 @@ class AppController {
   }
 
   // -----------------------------------------------------------------------
+  // TTS 切换
+  // -----------------------------------------------------------------------
+
+  toggleTTS() {
+    this.ttsEnabled = !this.ttsEnabled;
+    this.config.autoSpeak = this.ttsEnabled;
+    saveConfig(this.config);
+    this._updateTTSButton();
+
+    if (this.ttsEnabled) {
+      this._showToast('语音播报已开启 🔊', 'success');
+    } else {
+      this.speech.stopSpeaking();
+      this._showToast('语音播报已关闭 🔇', 'info');
+    }
+  }
+
+  _updateTTSButton() {
+    const btn = this.elements.btnTTS;
+    if (!btn) return;
+
+    if (this.ttsEnabled) {
+      btn.classList.add('active');
+      btn.querySelector('span').textContent = '🔊';
+      btn.title = '语音播报（开启）';
+    } else {
+      btn.classList.remove('active');
+      btn.querySelector('span').textContent = '🔇';
+      btn.title = '语音播报（关闭）';
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 移动端抽屉
+  // -----------------------------------------------------------------------
+
+  _openDrawer() {
+    this.elements.convOverlay.style.display = 'block';
+    this.elements.convDrawer.style.display = 'flex';
+    this._renderConvList();
+  }
+
+  _closeDrawer() {
+    this.elements.convOverlay.style.display = 'none';
+    this.elements.convDrawer.style.display = 'none';
+  }
+
+  // -----------------------------------------------------------------------
+  // 侧栏折叠
+  // -----------------------------------------------------------------------
+
+  _toggleSidebar() {
+    const sidebar = this.elements.conversationSidebar;
+    const expandBtn = this.elements.btnExpandSidebar;
+
+    if (sidebar) {
+      sidebar.classList.toggle('collapsed');
+      const isCollapsed = sidebar.classList.contains('collapsed');
+      if (expandBtn) {
+        expandBtn.style.display = isCollapsed ? 'flex' : 'none';
+      }
+      // 更新收起按钮文字
+      const toggleBtn = this.elements.btnToggleSidebar;
+      if (toggleBtn) {
+        toggleBtn.innerHTML = isCollapsed ? '▶ 展开' : '◀ 收起';
+      }
+    }
+  }
+
+  _expandSidebar() {
+    const sidebar = this.elements.conversationSidebar;
+    const expandBtn = this.elements.btnExpandSidebar;
+    if (sidebar) {
+      sidebar.classList.remove('collapsed');
+    }
+    if (expandBtn) {
+      expandBtn.style.display = 'none';
+    }
+    const toggleBtn = this.elements.btnToggleSidebar;
+    if (toggleBtn) {
+      toggleBtn.innerHTML = '◀ 收起';
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // 事件绑定
   // -----------------------------------------------------------------------
 
@@ -514,6 +1028,21 @@ class AppController {
     this.elements.btnSnapshot.addEventListener('click', () => this.takeSnapshot());
     this.elements.btnSend.addEventListener('click', () => this.sendTextMessage());
     this.elements.btnClearChat.addEventListener('click', () => this._clearChat());
+    this.elements.btnTTS?.addEventListener('click', () => this.toggleTTS());
+
+    // 对话管理
+    this.elements.btnNewConv?.addEventListener('click', () => this._createConversation());
+    this.elements.btnNewConvDrawer?.addEventListener('click', () => {
+      this._createConversation();
+      this._closeDrawer();
+    });
+    this.elements.btnToggleSidebar?.addEventListener('click', () => this._toggleSidebar());
+    this.elements.btnExpandSidebar?.addEventListener('click', () => this._expandSidebar());
+
+    // 移动端对话抽屉
+    this.elements.btnMobileConvList?.addEventListener('click', () => this._openDrawer());
+    this.elements.btnCloseDrawer?.addEventListener('click', () => this._closeDrawer());
+    this.elements.convOverlay?.addEventListener('click', () => this._closeDrawer());
 
     // 文本输入
     this.elements.textInput.addEventListener('keydown', (e) => {
@@ -560,6 +1089,18 @@ class AppController {
 
     // 页面卸载
     window.addEventListener('beforeunload', () => this._cleanup());
+
+    // 移动端：滑动手势关闭抽屉
+    let touchStartX = 0;
+    this.elements.convDrawer?.addEventListener('touchstart', (e) => {
+      touchStartX = e.touches[0].clientX;
+    }, { passive: true });
+    this.elements.convDrawer?.addEventListener('touchmove', (e) => {
+      const dx = e.touches[0].clientX - touchStartX;
+      if (dx < -60) {
+        this._closeDrawer();
+      }
+    }, { passive: true });
   }
 
   // -----------------------------------------------------------------------
@@ -579,6 +1120,25 @@ class AppController {
       btnSnapshot: document.getElementById('btnSnapshot'),
       btnSend: document.getElementById('btnSend'),
       btnClearChat: document.getElementById('btnClearChat'),
+      btnTTS: document.getElementById('btnTTS'),
+
+      // 对话管理
+      conversationSidebar: document.getElementById('conversationSidebar'),
+      convList: document.getElementById('convList'),
+      btnNewConv: document.getElementById('btnNewConv'),
+      btnToggleSidebar: document.getElementById('btnToggleSidebar'),
+      btnExpandSidebar: document.getElementById('btnExpandSidebar'),
+      btnNewConvDrawer: document.getElementById('btnNewConvDrawer'),
+
+      // 移动端
+      btnMobileConvList: document.getElementById('btnMobileConvList'),
+      convOverlay: document.getElementById('convOverlay'),
+      convDrawer: document.getElementById('convDrawer'),
+      convDrawerList: document.getElementById('convDrawerList'),
+      btnCloseDrawer: document.getElementById('btnCloseDrawer'),
+
+      // 对话标题
+      convTitle: document.getElementById('convTitle'),
 
       // 状态
       statusCamera: document.getElementById('statusCamera'),
@@ -600,7 +1160,6 @@ class AppController {
       btnCloseSettings: document.getElementById('btnCloseSettings'),
       btnSaveSettings: document.getElementById('btnSaveSettings'),
       btnCancelSettings: document.getElementById('btnCancelSettings'),
-      settingApiEndpoint: document.getElementById('settingApiEndpoint'),
       settingMaxDimension: document.getElementById('settingMaxDimension'),
       settingQuality: document.getElementById('settingQuality'),
       qualityValue: document.getElementById('qualityValue'),
@@ -609,6 +1168,7 @@ class AppController {
       sensitivityValue: document.getElementById('sensitivityValue'),
       settingLanguage: document.getElementById('settingLanguage'),
       settingVoice: document.getElementById('settingVoice'),
+      settingAutoSpeak: document.getElementById('settingAutoSpeak'),
     };
   }
 
@@ -620,7 +1180,6 @@ class AppController {
     const s = this.elements;
     const c = this.config;
 
-    if (s.settingApiEndpoint) s.settingApiEndpoint.value = c.apiEndpoint;
     if (s.settingMaxDimension) s.settingMaxDimension.value = c.maxImageDimension;
     if (s.settingQuality) {
       s.settingQuality.value = c.jpegQuality;
@@ -634,17 +1193,20 @@ class AppController {
     if (s.settingLanguage) s.settingLanguage.value = c.speechLang;
     if (s.modelSelect) s.modelSelect.value = c.model;
     if (s.fpsSelect) s.fpsSelect.value = String(c.fps);
+    if (s.settingAutoSpeak) s.settingAutoSpeak.checked = this.ttsEnabled;
   }
 
   _saveSettings() {
     const s = this.elements;
 
-    this.config.apiEndpoint = s.settingApiEndpoint?.value || this.config.apiEndpoint;
     this.config.maxImageDimension = parseInt(s.settingMaxDimension?.value) || 512;
     this.config.jpegQuality = parseFloat(s.settingQuality?.value) || 0.6;
     this.config.motionDetection = s.settingMotionDetection?.checked ?? true;
     this.config.motionSensitivity = parseInt(s.settingMotionSensitivity?.value) || 15;
     this.config.speechLang = s.settingLanguage?.value || 'zh-CN';
+    this.ttsEnabled = s.settingAutoSpeak?.checked ?? false;
+    this.config.autoSpeak = this.ttsEnabled;
+    this._updateTTSButton();
 
     // 同步到各模块
     this.camera.updateConfig({
@@ -659,7 +1221,7 @@ class AppController {
     });
 
     this.ai.updateConfig({
-      apiEndpoint: this.config.apiEndpoint,
+      model: this.config.model,
     });
 
     saveConfig(this.config);
@@ -693,11 +1255,27 @@ class AppController {
   }
 
   // -----------------------------------------------------------------------
-  // 对话管理
+  // 对话清空
   // -----------------------------------------------------------------------
 
   _clearChat() {
+    // 取消进行中的请求
+    if (this.isProcessing) {
+      this.ai.cancel();
+      this.isProcessing = false;
+      this._updateProcessingUI(false);
+    }
+
     this.ai.clearHistory();
+
+    // 清空当前对话的消息
+    const conv = this._getActiveConv();
+    if (conv) {
+      conv.messages = [];
+      conv.updatedAt = Date.now();
+      this._safeSaveConversations();
+    }
+
     this.elements.chatMessages.innerHTML = `
       <div class="welcome-message">
         <div class="welcome-icon">🤖</div>
@@ -708,6 +1286,7 @@ class AppController {
     this.elements.statusTokens.textContent = '--';
     this.elements.statusCost.textContent = '$0.000';
     this.ai.tokenTracker.reset();
+    this._renderConvList();
   }
 
   // -----------------------------------------------------------------------
