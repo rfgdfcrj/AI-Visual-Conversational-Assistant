@@ -1,0 +1,15 @@
+{
+  "name": "ai-vision-assistant",
+  "version": "1.0.0",
+  "description": "AI 视觉对话助手 - 摄像头+麦克风多模态对话应用 (通义千问 VL)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  }
+}

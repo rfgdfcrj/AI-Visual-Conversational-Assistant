@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# API Key（包含真实密钥，不能提交！）
+.env
+
+# Claude 内部文件
+.claude/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.log
