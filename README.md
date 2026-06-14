@@ -3,6 +3,8 @@
 > 摄像头 + 麦克风 + 通义千问多模态大模型 = 能看能听的 AI 伙伴
 
 🔗 **在线体验：**[https://ai-visual-conversational-assistant-production.up.railway.app/](https://ai-visual-conversational-assistant-production.up.railway.app/)
+demo视频链接通过网盘分享的文件：移动端.mp4
+链接: https://pan.baidu.com/s/1Wjyj-ZURDY02ED9QudXyPA?pwd=xepn 提取码: xepn
 
 ## 功能
 
